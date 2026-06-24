@@ -7,12 +7,17 @@ from telethon import TelegramClient, events
 
 # ==========================
 # CẤU HÌNH
-# =========================àe58e4e67b1764886481cf3842098"
+# ==========================
+
+API_ID = 31248277
+
+API_HASH = "0afe58e4e67b1764886481cf38420983"
 
 SESSION_NAME = "telegram_session"
 
 CHANNELS = [
-    "sansalehouse"
+    "sansalehouse",
+    "treckpee"
 
 ]
 
