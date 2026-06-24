@@ -2,41 +2,13 @@ from telethon import TelegramClient, events
 from datetime import timezone, timedelta
 
 # =========================
-# CẤU HÌNH
-# =========================
+# CẤU HÌNHÂPfe58e4e67b1764886481cf384209"
 
-API_ID = 31248277
+GROUP_ID = -
 
-API_HASH = "0afe58e4e67b1764886481cf38420983"
+SESSION_NAME = "_session"
 
-GROUP_ID = -1004465989044
-
-SESSION_NAME = "telegram_session"
-
-CHANNELS = [
-    "sansalehouse",
-    "treckpee"
-
-]
-
-KEYWORDS = [
-    "voucher 100k người mới",
-    "mã người mới",
-    "120k",
-    "100k/0",
-    "lẹ 100k người mới",
-    "100k người mới"
-]
-
-VN_TZ = timezone(timedelta(hours=7))
-
-client = TelegramClient(
-    "session",
-    API_ID,
-    API_HASH
-)
-
-# Lưu các tin đã xử lý
+ đã xử lý
 processed = set()
 
 @client.on(events.NewMessage(chats=CHANNELS))
