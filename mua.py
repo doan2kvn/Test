@@ -9,7 +9,25 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 urllib3.disable_warnings()
 
 # ==================== CẤU HÌNH HỆ THỐNG ====================
-DỮ LIỆU SQLITE ====================
+TOKEN = "8954593807:AAFLH9ZOv2qxTgrH-hOBfXBMwR6GgROakmk"
+ADMIN_ID = 5475751501  # CHÚ Ý: Thay bằng ID Telegram của bạn (Admin)
+BANK_STK = "8888833958"
+BANK_NAME = "BIDV"
+BANK_OWNER = "TRINH VIET HUAN"
+
+DB_FILE = "mua_data.db"
+bot = telebot.TeleBot(TOKEN)
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# Bộ nhớ tạm lưu trạng thái nhập liệu (State)
+USER_STATES = {}
+USER_ORDERS = {}
+ADMIN_STATES = {}
+
+# Phí đặt hộ cố định trừ vào ví của Bot (30k)
+PHI_DAT_HO = 30000
+
+# ==================== CẤU HÌNH CƠ SỞ DỮ LIỆU SQLITE ====================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -224,7 +242,26 @@ def start(message):
     user_id = message.from_user.id
     db_get_user(user_id, message.from_user.full_name)
     USER_STATES.pop(user_id, None)
-    bot.send_message(message.chat.id, f"👋 Chào mừng {message.from_user.full_name} đến với Hệ Thống Đặt Hộ!\nVui lòng chọn chức năng dưới bàn phím:", reply_markup=main_menu_keyboard())
+    
+    # Xử lý tránh lỗi ký tự đặc biệt
+    user_name = message.from_user.full_name.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
+    
+    # Thay "https://youtube.com/..." bằng link thật của bạn ở bên dưới nhé
+    welcome_text = (
+        f"👋 *Chào mừng {user_name} đến với Hệ Thống Đặt Hộ\\!*\n\n"
+        f"🛍️ *Mua sắm thả ga – Không lo thủ tục*\n"
+        f"Hệ thống hỗ trợ bạn đặt hàng tự động từ các sàn TMĐT về tận tay một cách nhanh chóng\\.\n\n"
+        f"📺 *Bạn là người mới?* "
+        f"[▶️ Xem Video Hướng Dẫn Tại Đây](https://youtube.com/link-video-cua-ban)\n\n"
+        f"👇 *Vui lòng chọn chức năng dưới bàn phím để bắt đầu:*"
+    )
+    
+    bot.send_message(
+        chat_id=message.chat.id, 
+        text=welcome_text, 
+        parse_mode="MarkdownV2", 
+        reply_markup=main_menu_keyboard()
+    )
 
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
@@ -277,7 +314,7 @@ def handle_menu_click(message):
         bot.send_message(message.chat.id, "📦 <b>Vui lòng gửi Link Shopee sản phẩm bạn muốn đặt hộ:</b>", parse_mode="HTML")
     elif message.text == "📞 Hỗ Trợ":
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("💬 Zalo Admin", url="https://zalo.me/09xxxxxxx"), InlineKeyboardButton("✈️ Telegram Admin", url="https://t.me/your_username"))
+        markup.add(InlineKeyboardButton("💬 Zalo Admin", url="https://zalo.me/0383835032"), InlineKeyboardButton("✈️ Telegram Admin", url="https://t.me/tranbadoan"))
         bot.send_message(message.chat.id, "Mọi vấn đề cần hỗ trợ vui lòng liên hệ Admin:", reply_markup=markup)
     elif message.text == "📜 Lịch Sử":
         orders = db_get_user_orders(user_id)
@@ -315,7 +352,7 @@ def xu_ly_nap_tien(message):
     amount = int(message.text.strip())
     noi_dung_ck = f"NAP {user_id}"
     vietqr_url = f"https://img.vietqr.io/image/{BANK_NAME}-{BANK_STK}-qr_only.jpg?amount={amount}&addInfo={noi_dung_ck}&accountName={BANK_OWNER}"
-    bot.send_photo(message.chat.id, vietqr_url, caption=f"🏦 <b>THÔNG TIN CHUYỂN KHOẢN</b>\n\n🔹 Ngân hàng: {BANK_NAME}\n🔹 STK: <code>{BANK_STK}</code>\n🔹 Số tiền: {amount:,} VND\n🔹 Nội dung: <code>{noi_dung_ck}</code>", parse_mode="HTML")
+    bot.send_photo(message.chat.id, vietqr_url, caption=f"🏦 <b>THÔNG TIN CHUYỂN KHOẢN</b>\n\n🔹 Ngân hàng: {BANK_NAME}\n🔹 STK: <code>{BANK_STK}</code>\n🔹 Tên Tài Khoản: {BANK_OWNER}\n🔹 Số tiền: {amount:,} VND\n🔹 Nội dung: <code>{noi_dung_ck}</code>", parse_mode="HTML")
     
     admin_markup = InlineKeyboardMarkup()
     admin_markup.add(InlineKeyboardButton("✅ Duyệt", callback_data=f"dep_duyet_{user_id}_{amount}"), InlineKeyboardButton("❌ Hủy", callback_data=f"dep_huy_{user_id}"))
@@ -582,7 +619,7 @@ def handle_admin_inputs(message):
         bot.send_message(message.chat.id, f"✅ Đã cập nhật trạng thái đơn thành công & Lưu Mã vận đơn: <code>{tracking_code}</code> cho đơn #{ord_id}!", parse_mode="HTML")
         
         try:
-            bot.send_message(buyer_id, f"🎉 <b>THÔNG BÁO: ĐƠN ĐẶT HỘ ĐÃ ĐƯỢC MUA THÀNH CÔNG</b>\n\n📦 Đơn hàng <b>#{ord_id}</b> của bạn đã được Admin mua hộ hoàn tất.\n🚚 Mã vận đơn: <code>{tracking_code}</code>\n<i>(Bạn có thể sao chép mã này để kiểm tra hành trình đơn hàng trên Shopee hoặc trong nút [📜 Lịch Sử] của Bot)</i>", parse_mode="HTML")
+            bot.send_message(buyer_id, f"🎉 <b>THÔNG BÁO: ĐƠN ĐẶT HỘ ĐÃ ĐƯỢC MUA THÀNH CÔNG</b>\n\n📦 Đơn hàng <b>#{ord_id}</b> của bạn đã được Admin mua hộ hoàn tất.\n🚚 Mã vận đơn: <code>{tracking_code}</code>\n<i>(Bạn có thể sao chép mã này để kiểm tra hành trình đơn hàng trên Shopee hoặc trong Bot @checkmadonbot)</i>", parse_mode="HTML")
         except: pass
         
         show_admin_main(message.chat.id)
