@@ -1,445 +1,566 @@
-import logging
+import os
 import sqlite3
-import asyncio
+import telebot
 import requests
-import json
-from datetime import datetime, time
-import pytz  # Thư viện xử lý múi giờ chuẩn
+import urllib3
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+# Tắt cảnh báo SSL
+urllib3.disable_warnings()
 
-# ⚠️ KHUYẾN KHÍCH: Đổi token mới nếu token này đã bị lộ công khai
-TOKEN = "8912685699:AAE6bx4ijvqwjM_x45BstJnXQcpwkQ7T0-g"
+# ==================== CẤU HÌNH HỆ THỐNG ====================
+TOKEN = "7679157857:AAH8n0E_Xx0unONGiOAwzpogmxfV0RS4M2g"
+ADMIN_ID = 5475751501  # CHÚ Ý: Thay bằng ID Telegram của bạn (Admin)
+BANK_STK = "1234567890"
+BANK_NAME = "MBBANK"
+BANK_OWNER = "NGUYEN VAN A"
 
-# Cấu hình múi giờ Hồ Chí Minh
-VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+DB_FILE = "bot_data.db"
+bot = telebot.TeleBot(TOKEN)
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+# Bộ nhớ tạm lưu trạng thái nhập liệu (State)
+USER_STATES = {}
+USER_ORDERS = {}
+ADMIN_STATES = {}
 
-# Cấu hình giao diện phím bấm nhanh (Thêm nút Thống kê)
-BTN_ADD = "➕ Thêm đơn"
-BTN_LIST = "📋 Danh sách đơn"
-BTN_STAT = "📊 Thống kê đơn"
-BTN_DELETE = "🗑 Xóa đơn"
+# Phí đặt hộ cố định trừ vào ví của Bot (30k)
+PHI_DAT_HO = 30000
 
-keyboard = [[BTN_ADD, BTN_LIST], [BTN_STAT, BTN_DELETE]]
-markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-DB_NAME = "spx_bot_v3.db"
-
-# ================= 🗄️ DATABASE LAYER =================
-
+# ==================== CẤU HÌNH CƠ SỞ DỮ LIỆU SQLITE ====================
 def init_db():
-    """Khởi tạo database với cấu trúc lưu trữ đơn và bảng thống kê tổng số lượng"""
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    # Bảng lưu đơn hiện tại đang theo dõi
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS orders(
-        chat_id TEXT NOT NULL,
-        tracking TEXT NOT NULL,
-        json_data TEXT, 
-        PRIMARY KEY(chat_id, tracking)
-    )
-    """)
-    # Bảng thống kê lịch sử đếm số lượng đơn (chỉ lưu số đếm)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS statistics(
-        chat_id TEXT NOT NULL,
-        delivered_count INTEGER DEFAULT 0,
-        delivering_count INTEGER DEFAULT 0,
-        cancelled_count INTEGER DEFAULT 0,
-        PRIMARY KEY(chat_id)
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-def update_stat(chat_id, status_type, delta=1):
-    """Cập nhật tăng/giảm số lượng đếm trong bảng thống kê"""
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    # Khởi tạo dòng nếu chưa có
-    cur.execute("INSERT OR IGNORE INTO statistics (chat_id) VALUES (?)", (chat_id,))
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
     
-    if status_type == "delivered":
-        cur.execute("UPDATE statistics SET delivered_count = delivered_count + ? WHERE chat_id = ?", (delta, chat_id))
-    elif status_type == "delivering":
-        cur.execute("UPDATE statistics SET delivering_count = delivering_count + ? WHERE chat_id = ?", (delta, chat_id))
-    elif status_type == "cancelled":
-        cur.execute("UPDATE statistics SET cancelled_count = cancelled_count + ? WHERE chat_id = ?", (delta, chat_id))
-        
+    # Bảng người dùng
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            balance INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Bảng Voucher hệ thống
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS vouchers (
+            code TEXT PRIMARY KEY,
+            discount_amount INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Bảng đơn hàng đặt hộ (Có lưu trạng thái đơn)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            product_name TEXT,
+            price INTEGER,
+            voucher_code TEXT,
+            voucher_discount INTEGER,
+            tien_cod INTEGER,
+            link TEXT,
+            status TEXT DEFAULT 'Chờ duyệt',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Bảng lịch sử nạp tiền chung
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            content TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
-# ================= 🌐 API LAYER (SPX) =================
-
-def check_spx_status(tracking):
-    """Bóc tách dữ liệu từ API SPX dựa trên cấu trúc JSON thực tế"""
-    url = (
-        "https://spx.vn/shipment/order/open/order/get_order_info"
-        f"?spx_tn={tracking}&language_code=vi"
-    )
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Referer": f"https://spx.vn/track/{tracking}",
-    }
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        if data.get("message") != "success":
-            return None
-
-        records = (
-            data.get("data", {})
-            .get("sls_tracking_info", {})
-            .get("records", [])
-        )
-        if not records:
-            return None
-
-        latest = records[0]
-        status = (
-            latest.get("buyer_description")
-            or latest.get("description")
-            or "Không rõ trạng thái"
-        )
-
-        # Xử lý lấy thời gian theo múi giờ VN chuẩn
-        actual_time = latest.get("actual_time")
-        if actual_time:
-            dt = datetime.fromtimestamp(int(actual_time), tz=VN_TZ)
-            status += f" *({dt.strftime('%d/%m/%Y %H:%M')})*"
-
-        return status
-    except Exception as e:
-        logging.error(f"Lỗi gọi API SPX cho mã {tracking}: {e}")
-        return None
-
-def detect_status_type(status_text):
-    """Phân tích chuỗi trạng thái để phân loại nhóm đơn hàng"""
-    text_lower = status_text.lower()
-    if any(keyword in text_lower for keyword in ["thành công", "đã giao", "hoàn thành"]):
-        return "delivered"
-    elif any(keyword in text_lower for keyword in ["hủy", "không thành công", "trả hàng", "bị trả", "sự cố"]):
-        return "cancelled"
-    else:
-        return "delivering"
-
-# ================= ⚡ BOT COMMANDS =================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /start khởi động bot"""
-    context.user_data.clear()
-    msg = (
-        "👋 *Chào mừng bạn đến với Bot theo dõi đơn hàng SPX!*\n\n"
-        "Hệ thống đã cấu hình múi giờ *Hồ Chí Minh (GMT+7)* và tự động dọn dẹp các đơn hoàn thành/hủy vào lúc 00:00 hàng ngày."
-    )
-    await update.message.reply_text(msg, reply_markup=markup, parse_mode="Markdown")
-
-# ================= 💬 MESSAGE HANDLER & STATE MACHINE =================
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-    chat_id = str(update.effective_chat.id)
-    state = context.user_data.get("state")
-
-    # ----- ➕ CHỨC NĂNG: THÊM ĐƠN HÀNG -----
-    if text == BTN_ADD:
-        context.user_data["state"] = "waiting_tracking"
-        await update.message.reply_text(
-            "📦 *Gửi mã vận đơn SPX cần theo dõi:*", 
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if state == "waiting_tracking":
-        tracking = text.upper()
-        await update.message.reply_text("🔍 _Đang kiểm tra mã vận đơn trên hệ thống SPX..._", parse_mode="Markdown")
-        
-        status = await asyncio.to_thread(check_spx_status, tracking)
-
-        if not status:
-            await update.message.reply_text(
-                "❌ *Không tìm thấy thông tin mã vận đơn này!*\nVui lòng kiểm tra lại mã hoặc thử lại sau.", 
-                reply_markup=markup,
-                parse_mode="Markdown"
-            )
-            context.user_data.clear()
-            return
-
-        context.user_data["tracking"] = tracking
-        context.user_data["status"] = status
-        context.user_data["state"] = "waiting_name"
-        await update.message.reply_text("📝 *Nhập tên gợi nhớ cho đơn hàng này:* \n_(Ví dụ: Áo khoác, Giày Nike...)_", parse_mode="Markdown")
-        return
-
-    if state == "waiting_name":
-        tracking = context.user_data["tracking"]
-        status = context.user_data["status"]
-        name = text
-
-        now_vn = datetime.now(VN_TZ)
-        order_dict = {
-            "name": name,
-            "tracking": tracking,
-            "last_status": status,
-            "created_at": now_vn.strftime('%d/%m/%Y %H:%M')
-        }
-        json_string = json.dumps(order_dict, ensure_ascii=False)
-
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT OR REPLACE INTO orders (chat_id, tracking, json_data) VALUES (?, ?, ?)",
-            (chat_id, tracking, json_string),
-        )
+# --- HÀM TƯƠNG TÁC DATABASE ---
+def db_get_user(user_id, full_name=""):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if row is None:
+        cursor.execute("INSERT INTO users (user_id, full_name, balance) VALUES (?, ?, ?)", (user_id, full_name, 0))
         conn.commit()
-        conn.close()
-
-        # Thống kê: Ghi nhận đơn mới thuộc nhóm trạng thái nào
-        status_type = detect_status_type(status)
-        update_stat(chat_id, status_type, delta=1)
-
-        context.user_data.clear()
-        
-        # UI MỚI: Đưa tên gợi nhớ lên tiêu đề kèm icon thích hợp
-        reply_msg = (
-            f"📦 *ĐƠN HÀNG: {name.upper()}*\n"
-            "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-            "✅ *Đã thêm vào hệ thống theo dõi thành công!*\n\n"
-            f"🏷 *Mã vận đơn:* `{tracking}` _(Chạm để copy)_\n"
-            f"🚚 *Trạng thái hiện tại:* {status}"
-        )
-        await update.message.reply_text(reply_msg, reply_markup=markup, parse_mode="Markdown")
-        return
-
-    # ----- 📋 CHỨC NĂNG: XEM DANH SÁCH -----
-    if text == BTN_LIST:
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute("SELECT json_data FROM orders WHERE chat_id=?", (chat_id,))
-        rows = cur.fetchall()
-        conn.close()
-
-        if not rows:
-            await update.message.reply_text("📭 *Danh sách trống.* Bạn chưa thêm đơn hàng nào!", parse_mode="Markdown")
-            return
-
-        msg = "📋 *DANH SÁCH ĐƠN HÀNG HIỆN TẠI:*\n"
-        msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
-        
-        for i, row in enumerate(rows, start=1):
-            order_data = json.loads(row[0])
-            msg += (
-                f"{i}. 📦 *{order_data['name'].upper()}*\n"
-                f"   🔹 Mã: `{order_data['tracking']}`\n"
-                f"   🚚 Trạng thái: {order_data['last_status']}\n\n"
-            )
-
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        return
-
-    # ----- 📊 CHỨC NĂNG: THỐNG KÊ (MỚI) -----
-    if text == BTN_STAT:
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT delivered_count, delivering_count, cancelled_count FROM statistics WHERE chat_id=?", 
-            (chat_id,)
-        )
-        row = cur.fetchone()
-        conn.close()
-
-        # Nếu chưa từng có bản ghi thống kê thì mặc định bằng 0
-        delivered = row[0] if row else 0
-        delivering = row[1] if row else 0
-        cancelled = row[2] if row else 0
-
-        stat_msg = (
-            "📊 *BÁO CÁO THỐNG KÊ SỐ LƯỢNG ĐƠN HÀNG*\n"
-            "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-            f"🟢 *Đơn thành công (Đã giao):* {delivered} đơn\n"
-            f"🟡 *Đơn đang trong quá trình giao:* {delivering} đơn\n"
-            f"🔴 *Đơn đã hủy / Giao lỗi:* {cancelled} đơn\n"
-            "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-            "ℹ️ _Số liệu được tích lũy tự động từ lúc bạn thêm đơn vào hệ thống._"
-        )
-        await update.message.reply_text(stat_msg, parse_mode="Markdown", reply_markup=markup)
-        return
-
-    # ----- 🗑 CHỨC NĂNG: XÓA ĐƠN HÀNG -----
-    if text == BTN_DELETE:
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute("SELECT json_data FROM orders WHERE chat_id=?", (chat_id,))
-        rows = cur.fetchall()
-        conn.close()
-
-        if not rows:
-            await update.message.reply_text("📭 Không có đơn hàng nào để xóa.", reply_markup=markup)
-            return
-
-        msg = "🗑 *Chọn hoặc nhập chính xác mã vận đơn muốn xóa dưới đây:*\n\n"
-        for row in rows:
-            order_data = json.loads(row[0])
-            msg += f"• {order_data['name']}: `{order_data['tracking']}`\n"
-
-        context.user_data["state"] = "delete"
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-        return
-
-    if state == "delete":
-        tracking = text.upper()
-        
-        # Lấy thông tin đơn trước khi xóa để giảm số lượng trong thống kê tương ứng nếu cần
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute("SELECT json_data FROM orders WHERE chat_id=? AND tracking=?", (chat_id, tracking))
-        row = cur.fetchone()
-        
-        if row:
-            order_data = json.loads(row[0])
-            status_type = detect_status_type(order_data["last_status"])
-            # Giảm 1 đơn trong thống kê trạng thái hiện tại vì người dùng chủ động xóa hoàn toàn đơn này
-            update_stat(chat_id, status_type, delta=-1)
-
-            cur.execute("DELETE FROM orders WHERE chat_id=? AND tracking=?", (chat_id, tracking))
-            conn.commit()
-            conn.close()
-            context.user_data.clear()
-            await update.message.reply_text("✅ *Đã xóa đơn hàng khỏi danh sách theo dõi.*", reply_markup=markup, parse_mode="Markdown")
-        else:
-            conn.close()
-            context.user_data.clear()
-            await update.message.reply_text("❌ *Không tìm thấy mã vận đơn này.*", reply_markup=markup, parse_mode="Markdown")
-        return
-
-
-# ================= ⏳ AUTOMATIC STATUS CHECK JOB =================
-
-async def auto_check_job(context: ContextTypes.DEFAULT_TYPE):
-    """Tiến trình ngầm quét trạng thái mới và đồng bộ phân loại thống kê khi thay đổi trạng thái"""
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id, tracking, json_data FROM orders")
-    rows = cur.fetchall()
-
-    for chat_id, tracking, json_str in rows:
-        order_data = json.loads(json_str)
-        old_status = order_data.get("last_status")
-        
-        new_status = await asyncio.to_thread(check_spx_status, tracking)
-
-        if new_status and new_status != old_status:
-            old_type = detect_status_type(old_status)
-            new_type = detect_status_type(new_status)
-
-            # Nếu đơn hàng chuyển dịch trạng thái (Ví dụ: Từ Đang giao -> Thành công)
-            if old_type != new_type:
-                update_stat(chat_id, old_type, delta=-1)  # Giảm nhóm cũ
-                update_stat(chat_id, new_type, delta=1)   # Tăng nhóm mới
-
-            order_data["last_status"] = new_status
-            new_json_str = json.dumps(order_data, ensure_ascii=False)
-
-            cur.execute(
-                "UPDATE orders SET json_data=? WHERE chat_id=? AND tracking=?",
-                (new_json_str, chat_id, tracking),
-            )
-            conn.commit()
-
-            try:
-                # UI MỚI: Tên gợi nhớ đưa lên tiêu đề kết hợp Icon
-                alert_msg = (
-                    f"🔔 *CẬP NHẬT ĐƠN HÀNG: {order_data['name'].upper()}*\n"
-                    "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-                    f"📦 *Mã vận đơn:* `{tracking}`\n"
-                    f"🚚 *Trạng thái mới:* {new_status}"
-                )
-                await context.bot.send_message(chat_id=chat_id, text=alert_msg, parse_mode="Markdown")
-            except Exception as e:
-                logging.error(f"Không thể gửi thông báo cho chat_id {chat_id}: {e}")
-
-        await asyncio.sleep(1.5)
-        
+        balance = 0
+    else:
+        balance = row[0]
     conn.close()
+    return {"balance": balance}
 
-
-# ================= 🕛 DAILY CLEANUP JOB (MỚI) =================
-
-async def daily_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Hành động tự động xóa đơn 'Thành công' và 'Hủy/Lỗi' đúng 00:00:00 đêm theo múi giờ VN"""
-    logging.info("Bắt đầu tiến trình tự động dọn dẹp đơn hàng lúc 00:00...")
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id, tracking, json_data FROM orders")
-    rows = cur.fetchall()
-
-    deleted_count = 0
-    for chat_id, tracking, json_str in rows:
-        order_data = json.loads(json_str)
-        status = order_data.get("last_status", "")
-        status_type = detect_status_type(status)
-
-        # Nếu là đơn thành công (delivered) hoặc đơn lỗi/hủy (cancelled) -> Tiến hành xóa bỏ
-        if status_type in ["delivered", "cancelled"]:
-            cur.execute("DELETE FROM orders WHERE chat_id=? AND tracking=?", (chat_id, tracking))
-            deleted_count += 1
-            
-            # Gửi tin nhắn thông báo nhẹ cho người dùng biết hệ thống đã tự dọn dẹp
-            try:
-                clean_msg = (
-                    f"🧹 *HỆ THỐNG TỰ ĐỘNG DỌN DẸP LÚC 00:00*\n"
-                    f"Đơn hàng *{order_data['name']}* (`{tracking}`) đã hoàn thành/hủy, "
-                    f"hệ thống đã xóa khỏi danh sách theo dõi định kỳ để tránh làm chật bộ nhớ của bạn."
-                )
-                await context.bot.send_message(chat_id=chat_id, text=clean_msg, parse_mode="Markdown")
-            except Exception:
-                pass
-
+def db_update_balance(user_id, amount):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
     conn.commit()
     conn.close()
-    logging.info(f"Đã tự động xóa thành công {deleted_count} đơn hàng hoàn tất/lỗi vào cuối ngày.")
 
+def db_add_history(user_id, content):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO history (user_id, content) VALUES (?, ?)", (user_id, content))
+    conn.commit()
+    conn.close()
 
-# ================= ⚙️ MAIN BOOTSTRAP =================
+def db_get_history(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT content, timestamp FROM history WHERE user_id = ? ORDER BY id DESC LIMIT 5", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [f"[{row[1]}] {row[0]}" for row in rows]
 
-def main():
-    init_db()
+# --- QUẢN LÝ VOUCHER ---
+def db_add_voucher(code, discount):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO vouchers (code, discount_amount) VALUES (?, ?)", (code.upper(), discount))
+        conn.commit()
+        s = True
+    except:
+        cursor.execute("UPDATE vouchers SET discount_amount = ? WHERE code = ?", (discount, code.upper()))
+        conn.commit()
+        s = True
+    conn.close()
+    return s
 
-    app = Application.builder().token(TOKEN).build()
+def db_get_vouchers():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT code, discount_amount FROM vouchers")
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"code": r[0], "discount": r[1]} for r in rows]
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+def db_delete_voucher(code):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM vouchers WHERE code = ?", (code.upper(),))
+    conn.commit()
+    conn.close()
+
+# --- QUẢN LÝ ĐƠN HÀNG ---
+def db_create_order(user_id, prod_name, price, vc_code, vc_discount, tien_cod, link):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO orders (user_id, product_name, price, voucher_code, voucher_discount, tien_cod, link) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, prod_name, price, vc_code, vc_discount, tien_cod, link))
+    order_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return order_id
+
+def db_get_user_orders(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, product_name, tien_cod, status FROM orders WHERE user_id = ? ORDER BY order_id DESC", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def db_get_order_details(order_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, user_id, product_name, price, voucher_code, voucher_discount, tien_cod, link, status FROM orders WHERE order_id = ?", (order_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+def db_update_order_status(order_id, status):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE orders SET status = ? WHERE order_id = ?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+def db_get_stats():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM orders WHERE status='Chờ duyệt'")
+    pending_orders = cursor.fetchone()[0]
+    conn.close()
+    return total_users, pending_orders
+
+# ==================== GIAO DIỆN MENU BÀN PHÍM CHÍNH ====================
+def main_menu_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("💰 Nạp Tiền"), KeyboardButton("🛒 Mua Hàng"),
+        KeyboardButton("📞 Hỗ Trợ"), KeyboardButton("📜 Lịch Sử"),
+        KeyboardButton("👤 Mục Tôi")
+    )
+    return markup
+
+# ==================== XỬ LÝ LỆNH /START & /ADMIN ====================
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    db_get_user(user_id, message.from_user.full_name)
+    USER_STATES.pop(user_id, None)
+    bot.send_message(message.chat.id, f"👋 Chào mừng {message.from_user.full_name} đến với Hệ Thống Đặt Hộ!\nVui lòng chọn chức năng dưới bàn phím:", reply_markup=main_menu_keyboard())
+
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "❌ Bạn không phải Quản trị viên.")
+        return
+    show_admin_main(message.chat.id)
+
+def show_admin_main(chat_id):
+    total_u, pending_o = db_get_stats()
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton(f"📦 Đơn Hàng Đang Chờ ({pending_o})", callback_data="adm_manage_orders"),
+        InlineKeyboardButton("🎟️ Quản Lý Mã Voucher Bot", callback_data="adm_manage_vouchers"),
+        InlineKeyboardButton("❌ Đóng Menu Admin", callback_data="adm_close")
+    )
+    bot.send_message(chat_id, f"🛠️ <b>HỆ THỐNG QUẢN TRỊ ADMIN PANEL</b>\n\n👥 Tổng số khách hàng: <b>{total_u}</b>\n⏳ Đơn hàng chưa xử lý: <b>{pending_o}</b>", parse_mode="HTML", reply_markup=markup)
+
+# ==================== ĐIỀU HƯỚNG MENU BÀN PHÍM CHÍNH ====================
+@bot.message_handler(func=lambda message: message.text in ["💰 Nạp Tiền", "🛒 Mua Hàng", "📞 Hỗ Trợ", "📜 Lịch Sử", "👤 Mục Tôi"])
+def handle_menu_click(message):
+    user_id = message.from_user.id
+    db_get_user(user_id, message.from_user.full_name)
+    USER_STATES.pop(user_id, None)
+
+    if message.text == "💰 Nạp Tiền":
+        msg = bot.send_message(message.chat.id, "💰 Nhập số tiền bạn muốn nạp vào ví Bot:")
+        bot.register_next_step_handler(msg, xu_ly_nap_tien)
+    elif message.text == "🛒 Mua Hàng":
+        USER_ORDERS[user_id] = {}
+        USER_STATES[user_id] = "WAIT_LINK"
+        bot.send_message(message.chat.id, "📦 <b>Vui lòng gửi Link Shopee sản phẩm bạn muốn đặt hộ:</b>", parse_mode="HTML")
+    elif message.text == "📞 Hỗ Trợ":
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💬 Zalo Admin", url="https://zalo.me/09xxxxxxx"), InlineKeyboardButton("✈️ Telegram Admin", url="https://t.me/your_username"))
+        bot.send_message(message.chat.id, "Mọi vấn đề cần hỗ trợ vui lòng liên hệ Admin:", reply_markup=markup)
+    elif message.text == "📜 Lịch Sử":
+        # Hiển thị cả Lịch sử số dư và Trạng thái đơn hàng đặt hộ
+        orders = db_get_user_orders(user_id)
+        history_list = db_get_history(user_id)
+        
+        text = "📦 <b>TRẠNG THÁI ĐƠN HÀNG ĐẶT HỘ CỦA BẠN:</b>\n"
+        if not orders:
+            text += "<i>Chưa có đơn đặt hàng nào.</i>\n"
+        else:
+            for o in orders[:5]:
+                # Định dạng: [Mã đơn #1] Tên SP - COD: 100,000đ -> Trạng thái
+                text += f"• <b>Đơn #{o[0]}:</b> {o[1][:20]}... | COD: <b>{o[2]:,}đ</b> ➡️ Trạng thái: <b>[{o[3]}]</b>\n"
+                
+        text += "\n💸 <b>LỊCH SỬ GIAO DỊCH VÍ:</b>\n"
+        if not history_list:
+            text += "<i>Chưa có biến động số dư.</i>"
+        else:
+            text += "\n".join(history_list)
+            
+        bot.send_message(message.chat.id, text, parse_mode="HTML")
+    elif message.text == "👤 Mục Tôi":
+        user_info = db_get_user(user_id)
+        bot.send_message(message.chat.id, f"👤 <b>THÔNG TIN TÀI KHOẢN</b>\n\n🆔 ID: <code>{user_id}</code>\n💰 Số dư ví cá nhân trên Bot: <b>{user_info['balance']:,} VND</b>\n<i>(Phí đặt hộ sẽ trừ 30,000 VNĐ từ nguồn ví này)</i>", parse_mode="HTML")
+
+# ==================== LUỒNG NẠP TIỀN TỰ ĐỘNG ====================
+def xu_ly_nap_tien(message):
+    user_id = message.from_user.id
+    if message.text in ["💰 Nạp Tiền", "🛒 Mua Hàng", "📞 Hỗ Trợ", "📜 Lịch Sử", "👤 Mục Tôi"]:
+        handle_menu_click(message)
+        return
+    if not message.text.strip().isdigit():
+        msg = bot.reply_to(message, "❌ Số tiền không hợp lệ, vui lòng nhập lại:")
+        bot.register_next_step_handler(msg, xu_ly_nap_tien)
+        return
+    amount = int(message.text.strip())
+    noi_dung_ck = f"NAP {user_id}"
+    vietqr_url = f"https://img.vietqr.io/image/{BANK_NAME}-{BANK_STK}-qr_only.jpg?amount={amount}&addInfo={noi_dung_ck}&accountName={BANK_OWNER}"
+    bot.send_photo(message.chat.id, vietqr_url, caption=f"🏦 <b>THÔNG TIN CHUYỂN KHOẢN</b>\n\n🔹 Ngân hàng: {BANK_NAME}\n🔹 STK: <code>{BANK_STK}</code>\n🔹 Số tiền: {amount:,} VND\n🔹 Nội dung: <code>{noi_dung_ck}</code>", parse_mode="HTML")
     
-    # 1. Quét cập nhật trạng thái liên tục sau mỗi 15 phút (900 giây)
-    app.job_queue.run_repeating(auto_check_job, interval=900, first=15)
+    admin_markup = InlineKeyboardMarkup()
+    admin_markup.add(InlineKeyboardButton("✅ Duyệt", callback_data=f"dep_duyet_{user_id}_{amount}"), InlineKeyboardButton("❌ Hủy", callback_data=f"dep_huy_{user_id}"))
+    bot.send_message(ADMIN_ID, f"🔔 Yêu cầu nạp tiền từ: {message.from_user.full_name} ({user_id}) - Số tiền: {amount:,} VND", reply_markup=admin_markup)
 
-    # 2. Hẹn lịch chạy dọn dẹp tự động đúng vào 00h:00m:00s mỗi ngày theo đúng múi giờ VN
-    target_time = time(hour=0, minute=0, second=0, tzinfo=VN_TZ)
-    app.job_queue.run_daily(daily_cleanup_job, time=target_time)
+# ==================== LUỒNG ĐẶT HÀNG TUẦN TỰ (CHỌN VOUCHER) ====================
+@bot.message_handler(func=lambda message: message.from_user.id in USER_STATES)
+def handle_shopping_steps(message):
+    user_id = message.from_user.id
+    state = USER_STATES[user_id]
+    if message.text in ["💰 Nạp Tiền", "🛒 Mua Hàng", "📞 Hỗ Trợ", "📜 Lịch Sử", "👤 Mục Tôi"]:
+        handle_menu_click(message)
+        return
 
-    print("🚀 [SUCCESS] SPX Telegram Bot v3 (Cải tiến Múi giờ VN + Thống kê + Tự xóa lúc 00h) đang chạy...")
-    app.run_polling()
+    # BƯỚC 1: CHECK LINK SẢN PHẨM SHOPEE
+    if state == "WAIT_LINK":
+        wait = bot.reply_to(message, "🔍 Đang check giá sản phẩm Shopee qua API...")
+        try:
+            r = requests.get(message.text.strip(), allow_redirects=True, headers=HEADERS, timeout=20, verify=False)
+            api = requests.get("https://data.addlivetag.com/product-data/product-data.php", params={"url": r.url}, headers=HEADERS, timeout=30, verify=False).json()
+            if api.get("status") != "success":
+                bot.edit_message_text("❌ Lỗi không lấy được dữ liệu giá từ link này. Vui lòng thử lại link khác:", message.chat.id, wait.message_id)
+                return
+            p = api["productInfo"]
+            USER_ORDERS[user_id] = {"product_name": p.get("productName", "Không rõ"), "price": p.get("price", 0), "image": p.get("imageUrl", ""), "link": r.url}
+            bot.delete_message(message.chat.id, wait.message_id)
+            
+            # Chuyển sang Bước 2: Hiển thị danh sách Voucher cho khách lựa chọn bằng nút bấm
+            USER_STATES[user_id] = "WAIT_VOUCHER_CHOICE"
+            v_list = db_get_vouchers()
+            markup = InlineKeyboardMarkup(row_width=1)
+            for v in v_list:
+                markup.add(InlineKeyboardButton(f"🎟️ Mã {v['code']} (Giảm {v['discount']:,}đ)", callback_data=f"sel_vc_{v['code']}_{v['discount']}"))
+            markup.add(InlineKeyboardButton("⏩ Không sử dụng mã Voucher", callback_data="sel_vc_NONE_0"))
+            
+            bot.send_message(message.chat.id, f"🔍 <b>SẢN PHẨM:</b> {USER_ORDERS[user_id]['product_name']}\n💰 Giá gốc Shopee: <b>{USER_ORDERS[user_id]['price']:,} VNĐ</b>\n\n👉 <b>Vui lòng CHỌN Voucher giảm giá hệ thống dưới đây:</b>", parse_mode="HTML", reply_markup=markup)
+        except Exception as e:
+            bot.edit_message_text("❌ Lỗi kết nối API Shopee. Vui lòng thử lại:", message.chat.id, wait.message_id)
 
+    # BƯỚC 3: NHẬN ĐỊA CHỈ
+    elif state == "WAIT_ADDRESS":
+        USER_ORDERS[user_id]["address"] = message.text.strip()
+        USER_STATES[user_id] = "WAIT_PHONE"
+        bot.send_message(message.chat.id, "📞 <b>Vui lòng nhập Số Điện Thoại người nhận hàng:</b>", parse_mode="HTML")
+
+    # BƯỚC 4: NHẬN SỐ ĐIỆN THOẠI
+    elif state == "WAIT_PHONE":
+        USER_ORDERS[user_id]["phone"] = message.text.strip()
+        USER_STATES[user_id] = "WAIT_NAME"
+        bot.send_message(message.chat.id, "👤 <b>Vui lòng nhập Họ tên người nhận hàng:</b>", parse_mode="HTML")
+
+    # BƯỚC 5: NHẬN TÊN & XUẤT PHIẾU XÁC NHẬN MUA
+    elif state == "WAIT_NAME":
+        USER_ORDERS[user_id]["name"] = message.text.strip()
+        order = USER_ORDERS[user_id]
+        
+        gia_shopee = order["price"]
+        voucher_discount = order["voucher_discount"]
+        
+        # Công thức tính tiền COD giao hàng: Giá gốc - Mã voucher khách chọn
+        tien_cod_thuc_te = gia_shopee - voucher_discount
+        if tien_cod_thuc_te < 0: tien_cod_thuc_te = 0
+        USER_ORDERS[user_id]["tien_cod"] = tien_cod_thuc_te
+
+        confirm_markup = InlineKeyboardMarkup()
+        confirm_markup.add(
+            InlineKeyboardButton("✅ Chắc Chắn Mua", callback_data="confirm_order_yes"),
+            InlineKeyboardButton("❌ Hủy Đơn", callback_data="confirm_order_no")
+        )
+
+        preview_text = f"""📊 <b>BẢNG XÁC NHẬN ĐƠN ĐẶT HỘ SHOPEE</b>
+
+📦 Sản phẩm: <a href="{order['link']}">{order['product_name']}</a>
+💰 Giá trên Shopee: <code>{gia_shopee:,}</code> VNĐ
+🎟️ Voucher đã chọn: <code>-{voucher_discount:,}</code> VNĐ ({order['voucher_code']})
+----------------------------------
+💳 <b>Phí dịch vụ trừ vào Ví Bot:</b> <code>-{PHI_DAT_HO:,}</code> VNĐ
+🚚 <b>Số tiền phải trả khi nhận hàng (COD):</b> <b>{tien_cod_thuc_te:,} VNĐ</b>
+
+📍 Người nhận: {order['name']} - {order['phone']}
+🏠 Địa chỉ: {order['address']}
+
+⚠️ Hệ thống chỉ trừ đúng {PHI_DAT_HO:,}đ tiền phí đặt hộ trong Ví Bot sau khi bạn bấm xác nhận."""
+
+        bot.send_message(message.chat.id, preview_text, parse_mode="HTML", reply_markup=confirm_markup, disable_web_page_preview=True)
+        USER_STATES.pop(user_id, None)
+
+# ==================== CALLBACK XỬ LÝ TOÀN BỘ NÚT BẤM (INLINE) ====================
+@bot.callback_query_handler(func=lambda call: True)
+def handle_all_callbacks(call):
+    data = call.data
+    user_id = call.from_user.id
+    
+    # --- 1. DUYỆT TIỀN NẠP ---
+    if data.startswith("dep_"):
+        bot.answer_callback_query(call.id)
+        info = data.split("_")
+        action, target_id = info[1], int(info[2])
+        if action == "duyet":
+            amount = int(info[3])
+            db_update_balance(target_id, amount)
+            db_add_history(target_id, f"Nạp tiền hệ thống: +{amount:,}đ")
+            bot.edit_message_text(f"✅ Đã duyệt nạp {amount:,}đ cho ID {target_id}", call.message.chat.id, call.message.message_id)
+            try: bot.send_message(target_id, f"🎉 Ví Bot của bạn đã được cộng +{amount:,} VND thành công!")
+            except: pass
+        elif action == "huy":
+            bot.edit_message_text(f"❌ Đã từ chối lệnh nạp tiền của ID {target_id}", call.message.chat.id, call.message.message_id)
+
+    # --- 2. KHÁCH CHỌN MÃ VOUCHER ---
+    elif data.startswith("sel_vc_"):
+        bot.answer_callback_query(call.id)
+        info = data.split("_")
+        code, discount = info[2], int(info[3])
+        if user_id in USER_ORDERS:
+            USER_ORDERS[user_id]["voucher_code"] = code
+            USER_ORDERS[user_id]["voucher_discount"] = discount
+            USER_STATES[user_id] = "WAIT_ADDRESS"
+            bot.edit_message_text(f"✅ Đã chọn Voucher: <b>{code}</b> (Giảm {discount:,}đ)\n\n📍 <b>Vui lòng nhập Địa Chỉ cụ thể nhận hàng:</b>", call.message.chat.id, call.message.message_id, parse_mode="HTML")
+
+    # --- 3. XÁC NHẬN MUA ĐƠN HÀNG ---
+    elif data.startswith("confirm_order_"):
+        bot.answer_callback_query(call.id)
+        action = data.replace("confirm_order_", "")
+        if action == "no":
+            USER_ORDERS.pop(user_id, None)
+            bot.edit_message_text("❌ Đơn đặt hộ đã được hủy bỏ.", call.message.chat.id, call.message.message_id)
+            return
+        if action == "yes":
+            if user_id not in USER_ORDERS: return
+            user_info = db_get_user(user_id)
+            if user_info["balance"] < PHI_DAT_HO:
+                bot.edit_message_text(f"❌ <b>Thất bại!</b> Ví Bot của bạn có {user_info['balance']:,}đ, không đủ {PHI_DAT_HO:,}đ phí dịch vụ. Hãy nạp tiền thêm.", call.message.chat.id, call.message.message_id, parse_mode="HTML")
+                USER_ORDERS.pop(user_id, None)
+                return
+            
+            order = USER_ORDERS[user_id]
+            # Khấu trừ ví và tạo đơn hàng trạng thái mặc định "Chờ duyệt"
+            db_update_balance(user_id, -PHI_DAT_HO)
+            order_id = db_create_order(user_id, order["product_name"], order["price"], order["voucher_code"], order["voucher_discount"], order["tien_cod"], order["link"])
+            db_add_history(user_id, f"Đặt hộ đơn #{order_id} | Phí trừ ví: -{PHI_DAT_HO:,}đ")
+
+            # Báo cho khách
+            bot.edit_message_text(f"🎉 <b>Đặt đơn hộ thành công! (Mã đơn #{order_id})</b>\n\n💰 Đã trừ cọc ví bot: -{PHI_DAT_HO:,}đ\n🚚 Shipper thu COD lúc nhận hàng: <b>{order['tien_cod']:,} VNĐ</b>\n\n<i>Đơn hàng đang chờ Admin kiểm tra và mua hộ trên hệ thống!</i>", call.message.chat.id, call.message.message_id, parse_mode="HTML")
+            
+            # Gửi tin nhắn cho ADMIN xử lý trực tiếp đơn hàng vừa phát sinh
+            send_admin_order_notification(order_id)
+            USER_ORDERS.pop(user_id, None)
+
+    # --- 4. ADMIN PANEL: XỬ LÝ ĐIỀU HƯỚNG CHUNG ---
+    elif data == "adm_close":
+        bot.answer_callback_query(call.id)
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        
+    elif data == "adm_manage_vouchers":
+        bot.answer_callback_query(call.id)
+        show_admin_vouchers(call.message.chat.id, call.message.message_id)
+        
+    elif data == "adm_add_vc_btn":
+        bot.answer_callback_query(call.id)
+        ADMIN_STATES[user_id] = "INPUT_VOUCHER"
+        bot.send_message(call.message.chat.id, "📝 Vui lòng nhập thông tin Voucher theo cú pháp:\n`TENMA SO_TIEN_GIAM`\nVí dụ: `GIAM50K 50000`", parse_mode="Markdown")
+
+    elif data.startswith("adm_del_vc_"):
+        bot.answer_callback_query(call.id)
+        vc_code = data.replace("adm_del_vc_", "")
+        db_delete_voucher(vc_code)
+        show_admin_vouchers(call.message.chat.id, call.message.message_id)
+
+    elif data == "adm_manage_orders":
+        bot.answer_callback_query(call.id)
+        # Xem đơn hàng đang ở trạng thái "Chờ duyệt"
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT order_id, product_name FROM orders WHERE status='Chờ duyệt' ORDER BY order_id DESC LIMIT 5")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        markup = InlineKeyboardMarkup()
+        if not rows:
+            markup.add(InlineKeyboardButton("⬅️ Quay Lại", callback_data="adm_back_main"))
+            bot.edit_message_text("🙌 Hiện tại không có đơn hàng nào đang ở trạng thái Chờ Duyệt.", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        else:
+            for r in rows:
+                markup.add(InlineKeyboardButton(f"📦 Đơn #{r[0]} - {r[1][:15]}...", callback_data=f"adm_view_ord_{r[0]}"))
+            markup.add(InlineKeyboardButton("⬅️ Quay Lại", callback_data="adm_back_main"))
+            bot.edit_message_text("📋 Danh sách các đơn đặt hộ đang chờ xử lý:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+    elif data == "adm_back_main":
+        bot.answer_callback_query(call.id)
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        show_admin_main(call.message.chat.id)
+
+    # --- 5. ADMIN XEM CHI TIẾT & SET TRẠNG THÁI ĐƠN HÀNG ---
+    elif data.startswith("adm_view_ord_"):
+        bot.answer_callback_query(call.id)
+        ord_id = int(data.replace("adm_view_ord_", ""))
+        show_admin_order_panel(call.message.chat.id, ord_id, call.message.message_id)
+
+    elif data.startswith("adm_set_status_"):
+        bot.answer_callback_query(call.id)
+        # Cú pháp: adm_set_status_TRANGTHAI_ORDERID
+        info = data.split("_")
+        status_text = info[3] # Đang mua / Đã mua thành công / Bị hủy
+        ord_id = int(info[4])
+        
+        db_update_order_status(ord_id, status_text)
+        ord_details = db_get_order_details(ord_id)
+        buyer_id = ord_details[1]
+        
+        # Gửi thông báo cập nhật thời gian thực cho Khách hàng biết đơn đổi trạng thái
+        try:
+            bot.send_message(buyer_id, f"🔔 <b>THÔNG BÁO CẬP NHẬT ĐƠN HÀNG ĐẶT HỘ</b>\n\n📦 Đơn hàng <b>#{ord_id}</b> của bạn đã được Admin chuyển sang trạng thái: <b>[{status_text}]</b>", parse_mode="HTML")
+        except: pass
+        
+        # Cập nhật lại giao diện quản trị hiện tại của Admin
+        show_admin_order_panel(call.message.chat.id, ord_id, call.message.message_id)
+
+# --- CÁC HÀM PHỤ TRỢ INTERFACE ADMIN ---
+def show_admin_vouchers(chat_id, msg_id):
+    v_list = db_get_vouchers()
+    markup = InlineKeyboardMarkup(row_width=1)
+    text = "🎟️ <b>DANH SÁCH VOUCHER TRÊN BOT:</b>\n\n"
+    if not v_list:
+        text += "<i>Hiện hệ thống chưa tạo mã voucher giảm giá nào.</i>"
+    else:
+        for v in v_list:
+            text += f"• Mã: <code>{v['code']}</code> | Giảm: <b>{v['discount']:,}đ</b>\n"
+            markup.add(InlineKeyboardButton(f"❌ Xóa mã {v['code']}", callback_data=f"adm_del_vc_{v['code']}"))
+            
+    markup.add(InlineKeyboardButton("➕ Thêm Voucher Mới", callback_data="adm_add_vc_btn"))
+    markup.add(InlineKeyboardButton("⬅️ Quay Lại Menu Chính", callback_data="adm_back_main"))
+    bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup)
+
+def send_admin_order_notification(order_id):
+    ord = db_get_order_details(order_id)
+    admin_text = f"🛍️ <b>ĐƠN ĐẶT HỘ MỚI PHÁT SINH (#{ord[0]})</b>\n\n👤 Khách hàng ID: <code>{ord[1]}</code>\n📦 Sản phẩm: <a href='{ord[7]}'>{ord[2]}</a>\n💰 Giá Shopee: {ord[3]:,}đ\n🎟️ Voucher: {ord[4]} (-{ord[5]:,}đ)\n🚚 <b>CÀI THU COD SHIPPER: {ord[6]:,} VNĐ</b>\n\n🚦 Trạng thái hiện tại: <b>[{ord[8]}]</b>"
+    
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("⚙️ Quản lý & Cài đặt trạng thái đơn này", callback_data=f"adm_view_ord_{ord[0]}")
+    )
+    bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML", reply_markup=markup)
+
+def show_admin_order_panel(chat_id, order_id, msg_id):
+    ord = db_get_order_details(order_id)
+    text = f"⚙️ <b>QUẢN LÝ ĐƠN HÀNG ĐẶT HỘ #{ord[0]}</b>\n\n👤 Khách hàng: ID <code>{ord[1]}</code>\n📦 Tên SP: {ord[2]}\n💰 Giá Shopee: {ord[3]:,}đ\n🎟️ Voucher: {ord[4]} (-{ord[5]:,}đ)\n🚚 <b>TIỀN THU COD: {ord[6]:,} VNĐ</b>\n🌐 Link: <a href='{ord[7]}'>Bấm để mở Shopee</a>\n\n🚦 Trạng thái hiện tại: <b>[{ord[8]}]</b>\n\n👉 <i>Hãy nhấn các nút bên dưới để thiết lập trạng thái đơn hàng bằng tay:</i>"
+    
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("⏳ Set trạng thái: ĐANG MUA", callback_data=f"adm_set_status_Đang mua_{ord[0]}"),
+        InlineKeyboardButton("✅ Set trạng thái: THÀNH CÔNG", callback_data=f"adm_set_status_Đã mua thành công_{ord[0]}"),
+        InlineKeyboardButton("❌ Set trạng thái: HỦY ĐƠN", callback_data=f"adm_set_status_Bị hủy_{ord[0]}"),
+        InlineKeyboardButton("⬅️ Quay lại danh sách đơn", callback_data="adm_manage_orders")
+    )
+    bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+
+# --- XỬ LÝ NHẬP LIỆU TEXT TỪ ADMIN (THÊM VOUCHER) ---
+@bot.message_handler(func=lambda message: message.from_user.id == ADMIN_ID and message.from_user.id in ADMIN_STATES)
+def handle_admin_inputs(message):
+    user_id = message.from_user.id
+    state = ADMIN_STATES[user_id]
+    
+    if state == "INPUT_VOUCHER":
+        text_split = message.text.split()
+        if len(text_split) < 2 or not text_split[1].isdigit():
+            bot.reply_to(message, "❌ Cú pháp sai, hãy nhập lại (Ví dụ: `GIAM30K 30000`):", parse_mode="Markdown")
+            return
+            
+        vc_code = text_split[0].upper().strip()
+        discount = int(text_split[1].strip())
+        
+        db_add_voucher(vc_code, discount)
+        ADMIN_STATES.pop(user_id, None)
+        bot.send_message(message.chat.id, f"✅ Đã lưu Voucher <code>{vc_code}</code> giảm <b>{discount:,}đ</b> vào cơ sở dữ liệu Bot thành công!", parse_mode="HTML")
+        show_admin_main(message.chat.id)
+
+# ==================== KHỞI CHẠY HỆ THỐNG ====================
 if __name__ == "__main__":
-    main()
+    init_db()
+    print("🗄️ Khởi tạo Hệ thống DB Đặt Hộ đa trạng thái & Admin Panel thành công!")
+    print("🤖 Bot đang chạy hoàn hảo...")
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
