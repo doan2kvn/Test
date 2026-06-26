@@ -15,7 +15,7 @@ BANK_STK = "8888833958"
 BANK_NAME = "BIDV"
 BANK_OWNER = "TRINH VIET HUAN"
 
-DB_FILE = "mua_data.db"
+DB_FILE = "mua_2data.db"
 bot = telebot.TeleBot(TOKEN)
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
