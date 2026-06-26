@@ -9,38 +9,7 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 urllib3.disable_warnings()
 
 # ==================== CẤU HÌNH HỆ THỐNG ====================
-TOKEN = "8954593807:AAFLH9ZOv2qxTgrH-hOBfXBMwR6GgROakmk"
-ADMIN_ID = 5475751501  # CHÚ Ý: Thay bằng ID Telegram của bạn (Admin)
-BANK_STK = "8888833958"
-BANK_NAME = "BIDV"
-BANK_OWNER = "TRINH VIET HUAN"
 
-DB_FILE = "mua_data.db"
-bot = telebot.TeleBot(TOKEN)
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-# Bộ nhớ tạm lưu trạng thái nhập liệu (State)
-USER_STATES = {}
-USER_ORDERS = {}
-ADMIN_STATES = {}
-
-# Phí đặt hộ cố định trừ vào ví của Bot (30k)
-PHI_DAT_HO = 30000
-
-# ==================== CẤU HÌNH CƠ SỞ DỮ LIỆU SQLITE ====================
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # Bảng người dùng
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            balance INTEGER DEFAULT 0
-        )
-    ''')
-    
     # Bảng Voucher hệ thống
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS vouchers (
