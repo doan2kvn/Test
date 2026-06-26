@@ -15,7 +15,7 @@ BANK_STK = "1234567890"
 BANK_NAME = "MBBANK"
 BANK_OWNER = "NGUYEN VAN A"
 
-DB_FILE = "bot_data.db"
+DB_FILE = "bot_daata.db"
 bot = telebot.TeleBot(TOKEN)
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
