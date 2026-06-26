@@ -9,7 +9,25 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 urllib3.disable_warnings()
 
 # ==================== CẤU HÌNH HỆ THỐNG ====================
-===== CẤU HÌNH CƠ SỞ DỮ LIỆU SQLITE ====================
+TOKEN = "8954593807:AAFLH9ZOv2qxTgrH-hOBfXBMwR6GgROakmk"
+ADMIN_ID = 5475751501  # CHÚ Ý: Thay bằng ID Telegram của bạn (Admin)
+BANK_STK = "8888833958"
+BANK_NAME = "BIDV"
+BANK_OWNER = "TRINH VIET HUAN"
+
+DB_FILE = "mua_data.db"
+bot = telebot.TeleBot(TOKEN)
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# Bộ nhớ tạm lưu trạng thái nhập liệu (State)
+USER_STATES = {}
+USER_ORDERS = {}
+ADMIN_STATES = {}
+
+# Phí đặt hộ cố định trừ vào ví của Bot (30k)
+PHI_DAT_HO = 30000
+
+# ==================== CẤU HÌNH CƠ SỞ DỮ LIỆU SQLITE ====================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -230,7 +248,7 @@ def start(message):
     
     # Thay "https://youtube.com/..." bằng link thật của bạn ở bên dưới nhé
     welcome_text = (
-        f"👋 *Chào mừng {user_name} đến với Hệ Thống Đặt Hộ\\!*\n\n"
+        f"👋 *Chào mừng {user_name} đến với Hệ Thống Đặt Đơn Rẻ\\!*\n\n"
         f"🛍️ *Mua sắm thả ga – Không lo thủ tục*\n"
         f"Hệ thống hỗ trợ bạn đặt hàng tự động từ các sàn TMĐT về tận tay một cách nhanh chóng\\.\n\n"
         f"📺 *Bạn là người mới?* "
@@ -334,7 +352,7 @@ def xu_ly_nap_tien(message):
     amount = int(message.text.strip())
     noi_dung_ck = f"NAP {user_id}"
     vietqr_url = f"https://img.vietqr.io/image/{BANK_NAME}-{BANK_STK}-qr_only.jpg?amount={amount}&addInfo={noi_dung_ck}&accountName={BANK_OWNER}"
-    bot.send_photo(message.chat.id, vietqr_url, caption=f"🏦 <b>THÔNG TIN CHUYỂN KHOẢN</b>\n\n🔹 Ngân hàng: {BANK_NAME}\n🔹 STK: <code>{BANK_STK}</code>\n🔹 Tên Tài Khoản: {BANK_OWNER}\n🔹 Số tiền: {amount:,} VND\n🔹 Nội dung: <code>{noi_dung_ck}</code>", parse_mode="HTML")
+    bot.send_photo(message.chat.id, vietqr_url, caption=f"🏦 <b>THÔNG TIN CHUYỂN KHOẢN</b>\n\n🔹 Ngân hàng: {BANK_NAME}\n🔹 STK: <code>{BANK_STK}</code>\n🔹 Tài Khoản: {BANK_OWNER}\n🔹 Số tiền: {amount:,} VND\n🔹 Nội dung: <code>{noi_dung_ck}</code>", parse_mode="HTML")
     
     admin_markup = InlineKeyboardMarkup()
     admin_markup.add(InlineKeyboardButton("✅ Duyệt", callback_data=f"dep_duyet_{user_id}_{amount}"), InlineKeyboardButton("❌ Hủy", callback_data=f"dep_huy_{user_id}"))
